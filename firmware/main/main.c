@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -9,7 +10,8 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "nvs_flash.h"
-#include "esp_http_server.h"
+#include "lwip/sockets.h"
+#include "lwip/netdb.h"
 
 static const char *TAG = "KeyboardServer";
 
@@ -132,178 +134,82 @@ void wifi_init_sta(void)
     ESP_LOGI(TAG, "WiFi Station started, connecting to %s", WIFI_SSID);
 }
 
-esp_err_t keyboard_handler(httpd_req_t *req)
+void udp_server_task(void *pvParameters)
 {
-    char buffer[512] = {0};
-    char key[128] = {0};
-    char state[32] = {0};
-    bool valid_key = false;
-    bool valid_state_val = false;
+    char rx_buffer[128];
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(4444);
 
-    if (req->content_len > 0)
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0)
     {
-        int received = httpd_req_recv(req, buffer, sizeof(buffer) - 1);
-        if (received <= 0)
+        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int err = bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err < 0)
+    {
+        ESP_LOGE(TAG, "Socket unable to bind: errno %d", errno);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "UDP server listening on port 4444");
+
+    while (1)
+    {
+        struct sockaddr_storage source_addr;
+        socklen_t socklen = sizeof(source_addr);
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
+                          (struct sockaddr *)&source_addr, &socklen);
+
+        if (len < 0)
         {
-            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Failed to read request body");
-            return ESP_FAIL;
+            ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
+            continue;
         }
 
-        buffer[received] = '\0';
+        rx_buffer[len] = 0;
+        
+        char key[128] = {0};
+        int state_val = -1;
 
-        const char *key_start = strstr(buffer, "\"key\"");
-        if (key_start)
+        if (sscanf(rx_buffer, "%127[^,],%d", key, &state_val) != 2)
         {
-            const char *value_start = strchr(key_start, ':');
-            if (value_start)
-            {
-                const char *quote = strchr(value_start, '"');
-                if (quote)
-                {
-                    sscanf(quote + 1, "%127[^\"]", key);
-                }
-            }
+            ESP_LOGW(TAG, "Invalid format: %s", rx_buffer);
+            continue;
         }
 
-        const char *state_start = strstr(buffer, "\"state\"");
-        if (state_start)
+        const char *state = (state_val == 1) ? "keydown" : "keyup";
+
+        if (!is_valid_key(key))
         {
-            const char *value_start = strchr(state_start, ':');
-            if (value_start)
-            {
-                const char *quote = strchr(value_start, '"');
-                if (quote)
-                {
-                    sscanf(quote + 1, "%31[^\"]", state);
-                }
-            }
+            ESP_LOGW(TAG, "Invalid key: %s", key);
+            continue;
         }
 
-        valid_key = is_valid_key(key);
-        valid_state_val = is_valid_state(state);
-    }
-    else
-    {
-        const char *query_string = strchr(req->uri, '?');
-        if (query_string)
+        if (state_val != 0 && state_val != 1)
         {
-            query_string++;
-            sscanf(query_string, "key=%127s", key);
-
-            const char *state_ptr = strstr(query_string, "state=");
-            if (state_ptr)
-            {
-                sscanf(state_ptr, "state=%31s", state);
-            }
-
-            valid_key = is_valid_key(key);
-            valid_state_val = is_valid_state(state);
+            ESP_LOGW(TAG, "Invalid state: %d", state_val);
+            continue;
         }
-    }
 
-    char response[512];
-    int len;
+        if (is_toggle_key(key) && state_val == 0)
+        {
+            ESP_LOGW(TAG, "Toggle key %s does not support keyup", key);
+            continue;
+        }
 
-    if (strlen(key) == 0 || strlen(state) == 0)
-    {
-        len = snprintf(response, sizeof(response),
-                       "{\"valid\":false,\"error\":\"Missing key or state\",\"key\":\"%s\",\"state\":\"%s\"}",
-                       key, state);
-    }
-    else if (!valid_key)
-    {
-        len = snprintf(response, sizeof(response),
-                       "{\"valid\":false,\"error\":\"Invalid key\",\"key\":\"%s\",\"state\":\"%s\"}",
-                       key, state);
-    }
-    else if (!valid_state_val)
-    {
-        len = snprintf(response, sizeof(response),
-                       "{\"valid\":false,\"error\":\"Invalid state. Use keydown or keyup\",\"key\":\"%s\",\"state\":\"%s\"}",
-                       key, state);
-    }
-    else if (is_toggle_key(key) && strcmp(state, "keyup") == 0)
-    {
-        len = snprintf(response, sizeof(response),
-                       "{\"valid\":false,\"error\":\"Toggle keys do not support keyup. Use keydown only\",\"key\":\"%s\",\"state\":\"%s\"}",
-                       key, state);
-    }
-    else
-    {
-        len = snprintf(response, sizeof(response),
-                       "{\"valid\":true,\"message\":\"Command accepted\",\"key\":\"%s\",\"state\":\"%s\"}",
-                       key, state);
         ESP_LOGI(TAG, "Key: %s, State: %s", key, state);
     }
 
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_send(req, response, len);
-
-    return ESP_OK;
-}
-
-esp_err_t root_handler(httpd_req_t *req)
-{
-    const char resp[] = "ESP32 Keyboard Server\n\n"
-                        "Available endpoints:\n"
-                        "POST http://<esp32-ip>/key with JSON body:\n"
-                        "  {\"key\": \"a\", \"state\": \"keydown\"}\n"
-                        "  {\"key\": \"a\", \"state\": \"keyup\"}\n\n"
-                        "GET http://<esp32-ip>/key?key=a&state=keydown\n\n"
-                        "Valid states: keydown, keyup\n"
-                        "Valid keys: a-z, 0-9, arrow keys, function keys, special keys\n";
-
-    httpd_resp_send(req, resp, strlen(resp));
-    return ESP_OK;
-}
-
-httpd_handle_t start_webserver(void)
-{
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_open_sockets = 2;
-    config.max_uri_handlers = 3;
-    config.stack_size = 8192;
-
-    httpd_handle_t server = NULL;
-
-    ESP_LOGI(TAG, "Starting HTTP server...");
-    
-    if (httpd_start(&server, &config) == ESP_OK)
-    {
-        ESP_LOGI(TAG, "HTTP server started");
-        
-        httpd_uri_t root = {
-            .uri = "/",
-            .method = HTTP_GET,
-            .handler = root_handler,
-        };
-        httpd_register_uri_handler(server, &root);
-        ESP_LOGI(TAG, "Registered / handler");
-
-        httpd_uri_t key_get = {
-            .uri = "/key",
-            .method = HTTP_GET,
-            .handler = keyboard_handler,
-        };
-        httpd_register_uri_handler(server, &key_get);
-        ESP_LOGI(TAG, "Registered /key GET handler");
-
-        httpd_uri_t key_post = {
-            .uri = "/key",
-            .method = HTTP_POST,
-            .handler = keyboard_handler,
-        };
-        httpd_register_uri_handler(server, &key_post);
-        ESP_LOGI(TAG, "Registered /key POST handler");
-
-        ESP_LOGI(TAG, "Keyboard server ready");
-    }
-    else
-    {
-        ESP_LOGE(TAG, "Failed to start HTTP server");
-    }
-
-    return server;
+    close(sock);
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
@@ -313,8 +219,7 @@ void app_main(void)
     wifi_init_sta();
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    start_webserver();
+    xTaskCreate(udp_server_task, "udp_server", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "Keyboard server running");
-    ESP_LOGI(TAG, "Send requests to: http://<esp32-ip>/key");
+    ESP_LOGI(TAG, "UDP Keyboard server running on port 4444");
 }
